@@ -6,19 +6,21 @@ Travel Invoice - 出差发票自动整理脚本
 依赖: himalaya, reportlab, PyPDF2
 """
 
+import base64
 import json
 import os
 import re
 import sys
 import subprocess
 import tempfile
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
 # 路径配置
 HIMALAYA_BIN = os.path.expanduser("~/.local/bin/himalaya")
-TEMP_DIR = tempfile.mkdtemp(prefix="travel_invoice_")
-OUTPUT_PDF = os.path.join(TEMP_DIR, "出差发票汇总.pdf")
+TEMP_DIR = ""
+OUTPUT_PDF = ""
 
 # 邮件配置
 MY_EMAIL = os.environ.get("MY_EMAIL", "{{MY_EMAIL}}")
@@ -32,6 +34,21 @@ KEYWORDS = {
 }
 
 EXCLUDE_KEYWORDS = ["作废", "红字", "退货", "退款", "支付通知", "退票通知", "改签通知", "候补订单", "兑现成功"]
+
+TYPE_NAMES = {
+    "hotel": "🏨 酒店",
+    "train": "🚄 高铁",
+    "airline": "✈️ 航空",
+    "taxi": "🚕 高德打车"
+}
+
+ATTACHMENT_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".zip", ".ofd")
+
+try:
+    from PyPDF2 import PdfReader, PdfWriter, PdfMerger
+except ImportError:
+    subprocess.run(["pip", "install", "PyPDF2"], timeout=60)
+    from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 
 
 def run_command(cmd, capture=True, shell=False):
@@ -100,8 +117,8 @@ def get_recent_emails(days=90, page_size=500):
                         "sender": sender,
                         "date": date_str
                     })
-            except:
-                # 解析失败，保留邮件
+            except (ValueError, TypeError):
+                # 日期解析失败，保留邮件
                 emails.append({
                     "id": email_id,
                     "subject": subject,
@@ -159,20 +176,8 @@ def scan_invoices():
     emails = get_recent_emails(days=90)
 
     # 分类结果
-    categorized = {
-        "hotel": [],
-        "train": [],
-        "airline": [],
-        "taxi": [],
-        "other": []
-    }
-
-    type_names = {
-        "hotel": "🏨 酒店",
-        "train": "🚄 高铁",
-        "airline": "✈️ 航空",
-        "taxi": "🚕 高德打车"
-    }
+    categorized = {t: [] for t in TYPE_NAMES}
+    categorized["other"] = []
 
     matched_count = 0
 
@@ -192,13 +197,13 @@ def scan_invoices():
                     "subject": subject,
                     "date": date
                 })
-            print(f"  ✅ [{type_names.get(inv_type, inv_type)}] {subject[:50]}")
+            print(f"  ✅ [{TYPE_NAMES.get(inv_type, inv_type)}] {subject[:50]}")
 
     # 打印统计
     print(f"\n📊 扫描结果:")
     for inv_type, items in categorized.items():
         if items:
-            print(f"  {type_names.get(inv_type, inv_type)}: {len(items)} 封")
+            print(f"  {TYPE_NAMES.get(inv_type, inv_type)}: {len(items)} 封")
 
     total = sum(len(v) for v in categorized.values())
     print(f"\n共发现 {total} 封发票邮件")
@@ -218,18 +223,18 @@ def download_attachments(emails, inv_type):
 
     downloaded = []
 
-    for email in emails[:10]:  # 限制每个类型最多 10 封
+    for email in emails[:10]:
         email_id = email.get("id", "")
         subject = email.get("subject", "")
 
-        # 下载附件到指定目录
+        before = set(os.listdir(type_dir))
+
         cmd = f"{HIMALAYA_BIN} attachment download -d {type_dir} {email_id}"
         result = run_command(cmd)
 
         if result and "Downloaded" in result:
-            # 查找下载的文件
-            files = os.listdir(type_dir)
-            new_files = [f for f in files if f.endswith(('.pdf', '.PDF', '.jpg', '.jpeg', '.png', '.zip', '.ofd'))]
+            after = set(os.listdir(type_dir))
+            new_files = [f for f in (after - before) if f.lower().endswith(ATTACHMENT_EXTENSIONS)]
             downloaded.append({
                 "email_id": email_id,
                 "subject": subject,
@@ -243,54 +248,36 @@ def download_attachments(emails, inv_type):
     return downloaded
 
 
-def crop_itinerary_pdf(pdf_path):
-    """裁剪高德行程单 PDF，用 PyPDF2 修改 CropBox 去掉广告和页码，保持原始矢量内容
-    
-    原始行程单 A4 页面(595x842pt)布局:
-    - 0~665pt: 广告banner (去掉)
-    - 665~460pt: 标题+信息+表格 (保留)
-    - 460~0pt: 空白+页码 (去掉)
-    
-    PDF坐标系从左下角开始，y轴向上。像素坐标从上到下，
-    经精确测量: 广告结束≈像素y=534→PDF y=665, 表格结束≈像素y=1018→PDF y=460
-    
-    Args:
-        pdf_path: 原始行程单 PDF 路径
-    
-    Returns:
-        裁剪后的 PDF 路径（原地覆盖）
-    """
-    try:
-        from PyPDF2 import PdfReader, PdfWriter
-    except ImportError:
-        run_command("pip install PyPDF2")
-        from PyPDF2 import PdfReader, PdfWriter
+# 高德行程单 PDF 裁剪坐标 (A4 595×842pt 实测)
+_CROP_A4_HEIGHT = 842
+_CROP_TOP_Y = 665       # 广告区域: y=665~842
+_CROP_BOTTOM_Y = 460    # 空白+页码: y=0~460
 
+
+def crop_itinerary_pdf(pdf_path):
+    """裁剪高德行程单 PDF，用 PyPDF2 修改 CropBox 去掉广告和页码，保持原始矢量内容"""
     reader = PdfReader(pdf_path)
     writer = PdfWriter()
-    
+
     for page in reader.pages:
         mb = page.mediabox
         orig_h = float(mb.height)
         orig_w = float(mb.width)
-        
-        # 精确裁剪坐标 (基于 A4 595x842 行程单实测)
-        if abs(orig_h - 842) < 10:  # 标准 A4 行程单
-            page.cropbox.lower_left = (0, 460)
-            page.cropbox.upper_right = (orig_w, 665)
+
+        if abs(orig_h - _CROP_A4_HEIGHT) < 10:
+            page.cropbox.lower_left = (0, _CROP_BOTTOM_Y)
+            page.cropbox.upper_right = (orig_w, _CROP_TOP_Y)
         else:
-            # 非标准尺寸，按比例裁剪
-            top_ratio = 665 / 842   # ≈0.79
-            bottom_ratio = 460 / 842  # ≈0.55
+            top_ratio = _CROP_TOP_Y / _CROP_A4_HEIGHT
+            bottom_ratio = _CROP_BOTTOM_Y / _CROP_A4_HEIGHT
             page.cropbox.lower_left = (0, orig_h * bottom_ratio)
             page.cropbox.upper_right = (orig_w, orig_h * top_ratio)
-        
+
         writer.add_page(page)
-    
-    # 原地覆盖
+
     with open(pdf_path, "wb") as f:
         writer.write(f)
-    
+
     print(f"  ✂️ 已裁剪行程单: {os.path.basename(pdf_path)}")
     return pdf_path
 
@@ -300,15 +287,9 @@ def create_pdf_report(categorized):
     print("\n📄 合并 PDF 报告...")
 
     # 收集所有 PDF 文件路径，按类型排序
-    pdf_pages = []  # [(pdf_path, inv_type, subject), ...]
+    pdf_pages = []
 
     type_order = ["taxi", "hotel", "airline", "train"]
-    type_names = {
-        "hotel": "🏨 酒店",
-        "train": "🚄 高铁",
-        "airline": "✈️ 航空",
-        "taxi": "🚕 高德打车"
-    }
 
     for inv_type in type_order:
         emails = categorized.get(inv_type, [])
@@ -319,12 +300,9 @@ def create_pdf_report(categorized):
         if not os.path.isdir(type_dir):
             continue
 
-        # 收集该类型下的所有 PDF 文件
-        # 先解压 zip 附件（12306 高铁发票是 zip 包含 pdf+ofd）
         for f in sorted(os.listdir(type_dir)):
             fpath = os.path.join(type_dir, f)
             if f.lower().endswith('.zip') and os.path.isfile(fpath):
-                import zipfile
                 try:
                     with zipfile.ZipFile(fpath, 'r') as zf:
                         for member in zf.namelist():
@@ -337,67 +315,58 @@ def create_pdf_report(categorized):
         for f in sorted(os.listdir(type_dir)):
             fpath = os.path.join(type_dir, f)
             if f.lower().endswith('.pdf') and os.path.isfile(fpath):
-                # 酒店排除结账单（只保留正式发票）
                 if inv_type == "hotel" and "结账单" in f:
                     print(f"  ⏭️ 跳过结账单: {f}")
                     continue
-                # 高德行程单：用 CropBox 裁剪去广告
                 if inv_type == "taxi" and "行程单" in f:
                     crop_itinerary_pdf(fpath)
                 pdf_pages.append((fpath, inv_type, f))
-
-    # 高德打车: 确保发票+行程单配对（相邻排列）
-    # 文件名一般: 电子发票.pdf / 电子行程单.pdf，已按文件名排序
 
     if not pdf_pages:
         print("⚠️ 没有找到 PDF 附件")
         return None
 
-    # 用 qpdf 直接合并所有 PDF 页面
     page_args = [p[0] for p in pdf_pages]
-    
-    # 检查 qpdf 是否可用
+
+    # 尝试用 qpdf 合并，不可用则回退 PyPDF2
     qpdf_check = run_command(["which", "qpdf"])
-    
+    merged = False
+
     if qpdf_check.strip():
         print(f"  使用 qpdf 合并 {len(page_args)} 个 PDF...")
         cmd = ["qpdf", "--empty", "--pages"] + page_args + ["--", OUTPUT_PDF]
-        result = run_command(cmd)
-        
-        if os.path.exists(OUTPUT_PDF) and os.path.getsize(OUTPUT_PDF) > 0:
-            print(f"✅ PDF 已生成: {OUTPUT_PDF}")
-            for inv_type in type_order:
-                count = sum(1 for p in pdf_pages if p[1] == inv_type)
-                if count:
-                    print(f"  {type_names.get(inv_type, inv_type)}: {count} 个文件")
-            return OUTPUT_PDF
-    
-    # qpdf 不可用或失败，用 PyPDF2 备选
-    print("  qpdf 不可用，使用 PyPDF2 合并...")
-    try:
-        from PyPDF2 import PdfMerger
-    except ImportError:
-        run_command("pip install PyPDF2")
-        from PyPDF2 import PdfMerger
-
-    merger = PdfMerger()
-    for fpath, inv_type, fname in pdf_pages:
+        run_command(cmd)
         try:
-            merger.append(fpath)
-        except Exception as e:
-            print(f"  ⚠️ 跳过 {fname}: {e}")
+            if os.path.getsize(OUTPUT_PDF) > 0:
+                merged = True
+        except OSError:
+            pass
 
-    merger.write(OUTPUT_PDF)
-    merger.close()
+    if not merged:
+        print("  qpdf 不可用，使用 PyPDF2 合并...")
+        merger = PdfMerger()
+        for fpath, inv_type, fname in pdf_pages:
+            try:
+                merger.append(fpath)
+            except Exception as e:
+                print(f"  ⚠️ 跳过 {fname}: {e}")
+        merger.write(OUTPUT_PDF)
+        merger.close()
 
-    if os.path.exists(OUTPUT_PDF):
+        try:
+            if os.path.getsize(OUTPUT_PDF) > 0:
+                merged = True
+        except OSError:
+            pass
+
+    if merged:
         print(f"✅ PDF 已生成: {OUTPUT_PDF}")
         for inv_type in type_order:
             count = sum(1 for p in pdf_pages if p[1] == inv_type)
             if count:
-                print(f"  {type_names.get(inv_type, inv_type)}: {count} 个文件")
+                print(f"  {TYPE_NAMES.get(inv_type, inv_type)}: {count} 个文件")
         return OUTPUT_PDF
-    
+
     return None
 
 
@@ -407,7 +376,6 @@ def send_email(pdf_path):
 
     # 读取 PDF 文件
     with open(pdf_path, "rb") as f:
-        import base64
         pdf_data = base64.b64encode(f.read()).decode('ascii')
 
     # 使用 himalaya 发送
@@ -463,18 +431,17 @@ def cleanup():
     try:
         shutil.rmtree(TEMP_DIR)
         print(f"🧹 已清理临时文件")
-    except:
+    except OSError:
         pass
 
 
 def main():
-    """主流程：扫描 → 生成 PDF → 等待用户确认 → 发送
-    
-    mode:
-      - "scan": 只扫描+生成PDF，不发送（默认，需用户确认后再单独调用发送）
-      - "send": 读取上次扫描结果并发送邮件
-      - "full": 扫描+生成+发送（仅当用户明确确认后使用）
-    """
+    """主流程：扫描 → 生成 PDF → 等待用户确认 → 发送"""
+    global TEMP_DIR, OUTPUT_PDF
+
+    TEMP_DIR = tempfile.mkdtemp(prefix="travel_invoice_")
+    OUTPUT_PDF = os.path.join(TEMP_DIR, "出差发票汇总.pdf")
+
     mode = sys.argv[1] if len(sys.argv) > 1 else "scan"
 
     print("=" * 50)
