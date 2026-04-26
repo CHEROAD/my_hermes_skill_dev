@@ -21,7 +21,17 @@ travel-invoice/
     └── configuration.md  # 配置说明（关键词、日期范围、邮箱等）
 ```
 
+## 安装
+
+```bash
+cp -r travel-invoice ~/.hermes/skills/productivity/
+```
+
+Hermas 已配置好邮箱即可使用。
+
 ## 使用方法
+
+### 通过 Hermes 触发
 
 ```
 /skill travel-invoice
@@ -32,6 +42,32 @@ travel-invoice/
 - 整理我的出差发票
 - 扫描最近三个月的高铁发票
 - 帮我打包航空机票发票
+
+### 手动运行脚本
+
+```bash
+# 仅扫描+生成PDF（默认模式，不自动发邮件）
+python3 scripts/travel_invoice.py scan
+
+# 扫描+生成+发送（需先确认后再用）
+python3 scripts/travel_invoice.py full
+
+# 单独发送已生成的PDF
+python3 scripts/travel_invoice.py send /tmp/xxx/出差发票汇总.pdf
+```
+
+### 环境变量
+
+| 变量 | 说明 | 示例 |
+|------|------|------|
+| `MY_EMAIL` | 收发邮件地址 | `user@qq.com` |
+
+### 首次使用
+
+1. 安装 himalaya 并配置 QQ 邮箱 IMAP/SMTP
+2. 安装 Python 依赖：`pip install PyPDF2`
+3. 设置环境变量：`export MY_EMAIL=your@qq.com`
+4. 运行 `python3 scripts/travel_invoice.py scan` 测试
 
 ## 依赖
 
